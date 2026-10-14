@@ -1,0 +1,34 @@
+# REVIEW.md
+
+Defects found in the starter `app/main.py`.
+
+| # | Where | What is wrong | How you'd notice it | How you fixed it |
+|---|---|---|---|---|
+| 1 | `compute_late_minutes` (helper) | `return minutes if minutes > 10 else 0` checks the truncated minute count, not the raw elapsed time. A punch-in at 09:40:01 (shift 09:30) yields `minutes = int(601/60) = 10`, and `10 > 10` is False, so it returns 0 instead of 10. R2 says late when the elapsed time is strictly more than 10:00, then `late_minutes` = floor of elapsed minutes. | Punch in at 09:40:01 IST for a 09:30 shift; expect `late_minutes: 10` but got 0. | Compare raw elapsed seconds against 600; if `> 600`, `late_minutes = floor(seconds / 60)`. |
+| 2 | `compute_late_minutes` (helper) | Builds `start` with `punch_in.replace(hour=h, minute=m, ...)`. This only works if `punch_in` is already in IST; the function receives a UTC instant, so the shift start is computed in the wrong zone and the date can roll over incorrectly. | Any punch-in where IST date differs from UTC date gives the wrong late value. | Convert `punch_in` to IST before building the shift start, or build shift start as an IST datetime. |
+| 3 | `compute_work_hours` (helper) | Uses Python's built-in `round(...)`, which is round-half-to-even (banker's rounding). R4 requires round-half-up. E.g. 8.995 → 9.00 under half-up but 8.99 (or 9.00 depending on float repr) under banker's. | work_hours of 8.995 hours should round to 9.00 but may round to 8.99. | Use `Decimal.quantize(..., rounding=ROUND_HALF_UP)`. |
+| 4 | `compute_overtime` (helper) | Ignores overnight shifts: it always builds `shift_end` on the same calendar date as `date_str`. For a 22:00-06:00 shift the end is the next day, so overtime is computed against the wrong instant. Also returns overtime for any positive diff, not only when >= 30 minutes (R3). | Overnight shift punch-out shows wrong overtime; < 30 min overtime returns non-zero. | Add one day for overnight shifts; return 0 when diff < 30 minutes. |
+| 5 | `compute_overtime` (helper) | `max(0, int(...))` truncates toward zero; for positive durations this equals floor, but it does not enforce the 30-minute minimum from R3. | 25 minutes overtime returns 25 instead of 0. | Check `diff_minutes >= 30` before returning. |
+| 6 | `/health` | Always returns `{"status": "ok"}` with 200. The contract requires 503 when MongoDB is unreachable. | Stop MongoDB and `GET /health` returns 200. | Run `client.admin.command("ping")` in a try/except and return 503 on failure. |
+| 7 | `create_employee` | Check-then-insert: `find_one` then `insert_one`. Two concurrent requests for the same `emp_code` can both pass the check and both insert (no unique index exists). Contract requires exactly one 201 and the rest 409. | Two parallel POST /employees with same emp_code both return 201. | Create a unique index on `emp_code` at startup and rely on `DuplicateKeyError` → 409. |
+| 8 | `create_employee` | `created_at = datetime.now()` is a naive local datetime. The API must return epoch milliseconds derived from a UTC instant; naive local times shift with the machine's TZ. | `created_at` is off by the local TZ offset. | Use `datetime.now(timezone.utc)`. |
+| 9 | `create_employee` | No validation that `shift_start != shift_end`, no format/length validation on `emp_code`, `email`, `department`, etc. | A zero-length shift or malformed email is accepted. | Add Pydantic validators and a `shift_start != shift_end` check returning 422. |
+| 10 | `list_employees` | `skip = page * page_size` — page 1 skips a full page, so the first page of results is missing. | `GET /employees?page=1` returns the second page's rows. | `skip = (page - 1) * page_size`. |
+| 11 | `list_employees` | `total = db.employees.count_documents({})` ignores the `department` filter, so `total` is wrong when filtering. | `GET /employees?department=Sales` returns total = all employees. | Count with the same filter `q`. |
+| 12 | `list_employees` | No sort. Contract requires `emp_code` ascending. | Rows come back in natural/insertion order. | `.sort("emp_code", 1)`. |
+| 13 | `punch_in` | `ts = datetime.fromtimestamp(body.punched_at / 1000)` is a naive local datetime and is not truncated to whole seconds (R1). | `date` is the local date, not the IST date; sub-second punches store fractional seconds. | Convert to UTC (`fromtimestamp(secs, tz=UTC)`) and truncate microseconds to 0. |
+| 14 | `punch_in` | `d = ts.date().isoformat()` uses the local/UTC date, not the IST calendar date, and does not handle overnight shifts (R1). | Punch-in at 2026-07-06T18:30:00Z (00:00 IST on the 7th) is stored under the 6th; overnight shifts get the wrong date. | Compute the IST date, and for overnight shifts push it back a day when the IST time is before `shift_end`. |
+| 15 | `punch_in` | No 404 for unknown employee — `emp` is `None` and `emp["shift_start"]` raises a 500. | POST punch-in for a non-existent emp_code returns 500. | Return 404 when the employee is not found. |
+| 16 | `punch_in` | Check-then-insert race for duplicate `(emp_code, date)` (same as #7). | Two parallel punch-ins for the same date both return 201. | Unique index on `(emp_code, date)` + `DuplicateKeyError` → 409. |
+| 17 | `punch_in` | Adds `doc["id"] = str(res.inserted_id)` to the response. The contract forbids exposing `_id`/an id field. | Response contains an `id` field. | Remove the `id` field; return only the contract fields. |
+| 18 | `punch_in` | `status` is not restricted to `PRESENT/WFH/ON_DUTY`; a client could punch in as `ABSENT`. | POST punch-in with `status: ABSENT` succeeds. | Validate `status` against the presence set. |
+| 19 | `list_attendance` | Loads the entire filtered collection into memory (`list(find(q))`), sorts in Python, and paginates by slicing. Will not work on 100k rows and uses no index for sorting. | Response time/memory blow up on large data; explain shows COLLSCAN + in-memory sort. | Use MongoDB `.sort().skip().limit()` with an index on `(date: -1, emp_code: 1)`; `count_documents(q)` for total. |
+| 20 | `list_attendance` | Adds an `id` field (same as #17). | Response contains `id`. | Return only contract fields. |
+
+## Things examined and decided were NOT defects
+
+- `IST = timezone(timedelta(hours=5, minutes=30))` — correctly defined and reused.
+- `load_dotenv()` at module top — loads `.env` while real env vars still win (os.getenv reads the live environment, which dotenv does not overwrite).
+- `MongoClient(os.getenv("MONGO_URI", ...))` — lazy connection; safe at import time.
+- The `compute_*` helper split (late / work_hours / overtime) — the separation is fine; the bugs are in the implementations, not the structure.
+- Returning `_id`-stripped dicts from `find(..., {"_id": 0})` in `list_employees` — projection is correct; only the `id` addition in punch-in/list_attendance was wrong.

@@ -1,0 +1,10 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+candidate_kit/
+data/
+mongo-data/
+*.log
+.idea/
+.vscode/
